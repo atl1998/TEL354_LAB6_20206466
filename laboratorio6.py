@@ -9,6 +9,9 @@ CONTROLLER_IP = "192.168.200.200"
 CONTROLLER_PORT = 8080
 CONTROLLER_URL = f"http://{CONTROLLER_IP}:{CONTROLLER_PORT}"
 
+BASE_URL = f"http://{CONTROLLER_IP}:8080"
+HEADERS = {'Content-Type': 'application/json'}
+
 class Alumno:
     """Clase para representar un alumno"""
     def __init__(self, nombre: str, codigo: int, mac: str):
@@ -46,7 +49,7 @@ class Servicio:
         return cls(data['nombre'], data['protocolo'], data['puerto'])
 
 class Servidor:
-    def __init__(self, nombre: str, ip: str, servicios: list[Servicio]):
+    def __init__(self, nombre: str, ip: str, servicios: List[Servicio]):
         self.nombre = nombre
         self.ip = ip
         self.servicios = servicios
@@ -65,7 +68,7 @@ class Servidor:
     
 
 class Curso:
-    def __init__(self, codigo: str, estado: str, nombre: str, alumnos: list[str], servidores: list[dict]):
+    def __init__(self, codigo: str, estado: str, nombre: str, alumnos: List[str], servidores: List[dict]):
         self.codigo = codigo
         self.estado = estado
         self.nombre = nombre
@@ -311,16 +314,221 @@ def menu_servidores():
             print("Opción inválida.")
 
 
+# --- MENÚ CONEXIONES ---
+def menu_conexiones():
+    while True:
+        print("\n--- MENÚ CONEXIONES ---")
+        print("1) Crear conexión")
+        print("0) Volver")
+        opcion = input("Seleccione una opción: ").strip()
+        if opcion == '1':
+            crear_conexion()
+        elif opcion == '0':
+            break
+        else:
+            print("Opción inválida.")
+
+def crear_conexion():
+    global alumnos, cursos, servidores
+
+    codigo_str = input("Código del alumno (H1): ").strip()
+    nombre_servidor = input("Nombre del servidor destino (H3): ").strip()
+    nombre_servicio = "ssh"
+
+    try:
+        codigo_alumno = int(codigo_str)
+    except ValueError:
+        print("Código inválido.")
+        return
+
+    alumno = next((a for a in alumnos if a.codigo == codigo_alumno), None)
+    if not alumno:
+        print("Alumno no encontrado.")
+        return
+
+    servidor = next((s for s in servidores if s.nombre.lower() == nombre_servidor.lower()), None)
+    if not servidor:
+        print("Servidor no encontrado.")
+        return
+
+    servicio = next((s for s in servidor.servicios if s.nombre.lower() == nombre_servicio), None)
+    if not servicio:
+        print("El servidor no ofrece el servicio solicitado.")
+        return
+
+    autorizado = False
+    for curso in cursos:
+        if curso.estado == "DICTANDO" and codigo_alumno in curso.alumnos:
+            for s in curso.servidores:
+                if s['nombre'].lower() == nombre_servidor.lower() and nombre_servicio in [x.lower() for x in s['servicios_permitidos']]:
+                    autorizado = True
+                    break
+
+    if not autorizado:
+        print("Alumno no autorizado para este servicio.")
+        return
+
+    # Obtener puntos de conexión
+    src_dpid, src_port = get_attachment_point(alumno.mac)
+    dst_dpid, dst_port = get_attachment_point_by_ip(servidor.ip)
+
+    if not src_dpid or not dst_dpid:
+        print("No se pudo obtener los puntos de conexión.")
+        return
+
+    ruta = get_route(src_dpid, src_port, dst_dpid, dst_port)
+    if not ruta:
+        print("No se pudo calcular la ruta.")
+        return
+
+    instalar_flows(ruta, alumno.mac, servidor.ip, servicio)
+
+    print("Conexión creada exitosamente.")
+
+
+
+
+# --- OBTENER PUNTO DE CONEXIÓN (DPID + Puerto) ---
+def get_attachment_point(mac):
+    """Retorna (dpid, puerto) del host con la MAC dada."""
+    url = f"{BASE_URL}/wm/device/"
+    resp = requests.get(url)
+    if resp.status_code == 200:
+        for dev in resp.json():
+            if mac.lower() in [m.lower() for m in dev.get("mac", [])]:
+                ap = dev.get("attachmentPoint", [{}])[0]
+                return ap.get("switchDPID"), ap.get("port")
+    return None, None
+
+# --- OBTENER RUTA ENTRE DOS PUNTOS ---
+def get_route(src_dpid, src_port, dst_dpid, dst_port):
+    """Retorna lista de hops: (switch, puerto)"""
+    url = f"{BASE_URL}/wm/topology/route/{src_dpid}/{src_port}/{dst_dpid}/{dst_port}/json"
+    resp = requests.get(url)
+    if resp.status_code == 200:
+        return [(hop["switch"], hop["port"]) for hop in resp.json()]
+    return []
+
+def get_attachment_point_by_ip(ip):
+    url = f"{BASE_URL}/wm/device/"
+    r = requests.get(url)
+    if r.status_code == 200:
+        for dev in r.json():
+            if ip in dev.get("ipv4", []):
+                ap = dev.get("attachmentPoint", [])
+                if ap:
+                    return ap[0].get("switchDPID"), ap[0].get("port")
+    return None, None
+
+def instalar_flows(ruta, mac_origen, ip_destino, servicio):
+    proto = servicio.protocolo.lower()
+    puerto = servicio.puerto
+    ip_proto = 6 if proto == "tcp" else 17
+
+    print("\nRuta calculada:")
+    for hop in ruta:
+        print(f"  - Switch: {hop[0]}, Puerto: {hop[1]}")
+
+    # Instalar flows en cada par de saltos
+    for i in range(len(ruta) - 1):
+        dpid = ruta[i][0]
+        in_port = ruta[i][1]
+        out_port = ruta[i + 1][1]
+
+        # Tráfico de H1 a H3 (SSH)
+        flow_alumno_a_srv = {
+            "switch": dpid,
+            "name": f"fwd-{uuid.uuid4()}",
+            "priority": 40000,
+            "eth_type": "0x0800",
+            "eth_src": mac_origen,
+            "ipv4_dst": ip_destino,
+            "ip_proto": ip_proto,
+            f"{proto}_dst": puerto,
+            "active": "true",
+            "actions": f"output={out_port}"
+        }
+
+        # Tráfico de retorno (H3 a H1)
+        flow_srv_a_alumno = {
+            "switch": dpid,
+            "name": f"rev-{uuid.uuid4()}",
+            "priority": 40000,
+            "eth_type": "0x0800",
+            "ipv4_src": ip_destino,
+            "ip_proto": ip_proto,
+            f"{proto}_src": puerto,
+            "active": "true",
+            "actions": f"output={in_port}"
+        }
+
+        # ARP flow
+        flow_arp = {
+            "switch": dpid,
+            "name": f"arp-{uuid.uuid4()}",
+            "eth_type": "0x0806",
+            "priority": 30000,
+            "active": "true",
+            "actions": f"output={out_port}"
+        }
+
+        for flow in [flow_alumno_a_srv, flow_srv_a_alumno, flow_arp]:
+            resp = requests.post(f"{BASE_URL}/wm/staticflowpusher/json",
+                                 headers=HEADERS, data=json.dumps(flow))
+            print("Instalando flow:", json.dumps(flow, indent=2))
+            print(f"Respuesta: {resp.status_code} {resp.text}")
+            if resp.status_code != 200:
+                print(f"Error instalando flow en {dpid}: {resp.text}")
+
+    # Último salto hacia H3 (flow directo al host destino)
+    last_dpid, last_port = ruta[-1]
+    flow_final = {
+        "switch": last_dpid,
+        "name": f"final-{uuid.uuid4()}",
+        "priority": 40000,
+        "eth_type": "0x0800",
+        "ipv4_dst": ip_destino,
+        "ip_proto": ip_proto,
+        f"{proto}_dst": puerto,
+        "active": "true",
+        "actions": f"output={last_port}"
+    }
+
+    resp = requests.post(f"{BASE_URL}/wm/staticflowpusher/json",
+                         headers=HEADERS, data=json.dumps(flow_final))
+    print("Instalando último flow (servidor):", json.dumps(flow_final, indent=2))
+    print(f"Respuesta: {resp.status_code} {resp.text}")
+
+    # ARP en el último switch
+    flow_arp_final = {
+        "switch": last_dpid,
+        "name": f"arp-final-{uuid.uuid4()}",
+        "eth_type": "0x0806",
+        "priority": 30000,
+        "active": "true",
+        "actions": f"output={last_port}"
+    }
+
+    resp_arp = requests.post(f"{BASE_URL}/wm/staticflowpusher/json",
+                             headers=HEADERS, data=json.dumps(flow_arp_final))
+    print("Instalando ARP final:", json.dumps(flow_arp_final, indent=2))
+    print(f"Respuesta: {resp_arp.status_code} {resp_arp.text}")
+
+
 
 def menu_principal():
     while True:
-        print("\n--- MENÚ SDN ---")
+        print("####################################################")
+        print("Network Policy manager de la UPSM")
+        print("####################################################")
         print("1. Importar")
         print("2. Exportar")
         print("3. Cursos")
         print("4. Alumnos")
         print("5. Servidores")
-        print("6. Salir")
+        print("6. Politicas")
+        print("7. Conexiones")
+        print("8. Salir")
         opcion = input("Seleccione una opción: ")
 
         if opcion == '1':
@@ -338,6 +546,10 @@ def menu_principal():
         elif opcion == '5':
             menu_servidores()
         elif opcion == '6':
+            break
+        elif opcion == '7':
+            menu_conexiones()
+        elif opcion == '8':
             print("Cerrando programa.")
             break
         else:
