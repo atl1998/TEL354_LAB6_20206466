@@ -9,6 +9,8 @@ CONTROLLER_IP = "192.168.200.200"
 CONTROLLER_PORT = 8080
 CONTROLLER_URL = f"http://{CONTROLLER_IP}:{CONTROLLER_PORT}"
 
+conexiones = []
+
 BASE_URL = f"http://{CONTROLLER_IP}:8080"
 HEADERS = {'Content-Type': 'application/json'}
 
@@ -314,205 +316,187 @@ def menu_servidores():
             print("Opción inválida.")
 
 
-# --- MENÚ CONEXIONES ---
+def alumno_puede_conectarse(cod_alumno, servidor, servicio):
+    for curso in cursos:
+        if curso.estado != "DICTANDO":
+            continue
+        if cod_alumno not in curso.alumnos:
+            continue
+        for s in curso.servidores:  # <- cada s es un dict
+            if s['nombre'].lower() == servidor.lower():
+                if servicio.lower() in [srv.lower() for srv in s['servicios_permitidos']]:
+                    return True
+    print(f" El alumno {cod_alumno} no tiene acceso al servicio {servicio} en el servidor {servidor}.")
+    return False
+
+
+def build_arp_flow(handler, dpid, ip_src, ip_dst, out_port, sentido="arp"):
+    """
+    Flow para permitir ARP entre hosts.
+    """
+    flow = {
+        "switch": dpid,
+        "name": f"{handler}_{sentido}",
+        "priority": "32769",  # Priorizamos ARP
+        "eth_type": "0x0806",  # ARP
+        "arp_spa": ip_src,  # IP de origen
+        "arp_tpa": ip_dst,  # IP de destino
+        "active": "true",
+        "actions": f"output={out_port}"  # Acción de salida
+    }
+    return flow
+
+def build_flow(handler, dpid, mac_src, ip_src, mac_dst, ip_dst, tcp_port, out_port, sentido="fw"):
+    """
+    Construye un flow para tráfico de L3 (IP) y L4 (TCP/UDP).
+    """
+    flow = {
+        "switch": dpid,  # DPID del switch
+        "name": f"{handler}_{sentido}",  # Flow name (handler + dirección)
+        "priority": "32768",  # Prioridad del flow
+        "eth_type": "0x0800",  # Tipo de Ethernet: IPv4
+        "ipv4_src": ip_src,  # Dirección IP de origen
+        "ipv4_dst": ip_dst,  # Dirección IP de destino
+        "ip_proto": "0x06",  # Protocolo: TCP
+        "tcp_dst": tcp_port,  # Puerto TCP de destino (puede cambiar según servicio)
+        "active": "true",  # Flow activo
+        "actions": f"output={out_port}"  # Acción: salida por el puerto
+    }
+    return flow
+
+
 def menu_conexiones():
     while True:
         print("\n--- MENÚ CONEXIONES ---")
         print("1) Crear conexión")
-        print("0) Volver")
-        opcion = input("Seleccione una opción: ").strip()
-        if opcion == '1':
-            crear_conexion()
-        elif opcion == '0':
-            break
-        else:
-            print("Opción inválida.")
+        print("2) Listar conexiones")
+        print("3) Eliminar conexión")
+        print("4) Volver")
+        op = input("Seleccione una opción: ").strip()
 
-def crear_conexion():
-    global alumnos, cursos, servidores
+        if op == '1':
+            # Pedir información del alumno, servidor y servicio
+            cod_alumno_str = input("Código del alumno: ").strip()
+            try:
+                cod_alumno = int(cod_alumno_str)
+            except ValueError:
+                print("Código de alumno inválido.")
+                return
+            nombre_servidor = input("Nombre del servidor: ")
+            nombre_servicio = input("Nombre del servicio: ")
 
-    codigo_str = input("Código del alumno (H1): ").strip()
-    nombre_servidor = input("Nombre del servidor destino (H3): ").strip()
-    nombre_servicio = "ssh"
+            # Validar si el alumno tiene acceso al servicio
+            if not alumno_puede_conectarse(cod_alumno, nombre_servidor, nombre_servicio):
+                print(" Alumno NO autorizado para este servicio.")
+                continue
 
-    try:
-        codigo_alumno = int(codigo_str)
-    except ValueError:
-        print("Código inválido.")
-        return
+            # Asignar un handler único para la conexión
+            handler = str(uuid.uuid4())[:8]
+            conexiones.append({'handler': handler, 'alumno': cod_alumno, 'servidor': nombre_servidor, 'servicio': nombre_servicio})
+            print(f" Conexión creada. Handler: {handler}")
 
-    alumno = next((a for a in alumnos if a.codigo == codigo_alumno), None)
-    if not alumno:
-        print("Alumno no encontrado.")
-        return
+            # Obtener los datos necesarios para los flows
+            ip_servidor = next(s.ip for s in servidores if s.nombre == nombre_servidor)
+            mac_alumno = next(a.mac for a in alumnos if a.codigo == cod_alumno)
 
-    servidor = next((s for s in servidores if s.nombre.lower() == nombre_servidor.lower()), None)
-    if not servidor:
-        print("Servidor no encontrado.")
-        return
+            #DPID y puerto de salida
+            dpid, out_port = get_attachment_point_by_ip(ip_servidor)
+            if not dpid or not out_port:
+                print("Error: No se pudo obtener el DPID o puerto del servidor desde Floodlight.")
+                continue
 
-    servicio = next((s for s in servidor.servicios if s.nombre.lower() == nombre_servicio), None)
-    if not servicio:
-        print("El servidor no ofrece el servicio solicitado.")
-        return
+            puerto_servicio = 22 if nombre_servicio == "ssh" else 80  # Asumir puerto SSH o HTTP
 
-    autorizado = False
-    for curso in cursos:
-        if curso.estado == "DICTANDO" and codigo_alumno in curso.alumnos:
-            for s in curso.servidores:
-                if s['nombre'].lower() == nombre_servidor.lower() and nombre_servicio in [x.lower() for x in s['servicios_permitidos']]:
-                    autorizado = True
+            # Crear el flow de alumno a servidor (forwarding)
+            flow_fw = build_flow(handler, dpid, mac_alumno, ip_servidor, mac_alumno, ip_servidor, puerto_servicio, out_port, sentido="fw")
+            push_flow(flow_fw)
+            print(f" Flow de Forwarding instalado: {flow_fw['name']}")
+
+            # Crear el flow de servidor a alumno (reverse flow)
+            flow_bw = build_flow(handler, dpid, mac_alumno, ip_servidor, mac_alumno, ip_servidor, puerto_servicio, 1, sentido="bw")
+            push_flow(flow_bw)
+            print(f" Flow de Reverse instalado: {flow_bw['name']}")
+
+            # Flujos ARP (para resolución de IPs)
+            flow_arp_fw = build_arp_flow(handler, dpid, ip_servidor, ip_servidor, out_port, sentido="arp_fw")
+            push_flow(flow_arp_fw)
+            print(f" Flow ARP Forward instalado: {flow_arp_fw['name']}")
+
+            flow_arp_bw = build_arp_flow(handler, dpid, ip_servidor, ip_servidor, 1, sentido="arp_bw")
+            push_flow(flow_arp_bw)
+            print(f" Flow ARP Reverse instalado: {flow_arp_bw['name']}")
+
+        elif op == '2':
+            if not conexiones:
+                print("No hay conexiones creadas.")
+            else:
+                for c in conexiones:
+                    print(f"Handler: {c['handler']}, Alumno: {c['alumno']}, Servidor: {c['servidor']}, Servicio: {c['servicio']}")
+
+        elif op == '3':
+            handler = input("Handler de la conexión a eliminar: ")
+            for i, c in enumerate(conexiones):
+                if c['handler'] == handler:
+                    # Eliminar los flows correspondientes en Floodlight
+                    delete_flow(f"{handler}_fw")
+                    delete_flow(f"{handler}_bw")
+                    delete_flow(f"{handler}_arp_fw")
+                    delete_flow(f"{handler}_arp_bw")
+
+                    # Eliminar la conexión de la lista
+                    conexiones.pop(i)
+                    print(" Conexión eliminada y flows removidos.")
                     break
+            else:
+                print(" No se encontró el handler.")
 
-    if not autorizado:
-        print("Alumno no autorizado para este servicio.")
-        return
+        elif op == '4':
+            break  # Volver al menú principal
 
-    # Obtener puntos de conexión
-    src_dpid, src_port = get_attachment_point(alumno.mac)
-    dst_dpid, dst_port = get_attachment_point_by_ip(servidor.ip)
-
-    if not src_dpid or not dst_dpid:
-        print("No se pudo obtener los puntos de conexión.")
-        return
-
-    ruta = get_route(src_dpid, src_port, dst_dpid, dst_port)
-    if not ruta:
-        print("No se pudo calcular la ruta.")
-        return
-
-    instalar_flows(ruta, alumno.mac, servidor.ip, servicio)
-
-    print("Conexión creada exitosamente.")
-
-
-
-
-# --- OBTENER PUNTO DE CONEXIÓN (DPID + Puerto) ---
-def get_attachment_point(mac):
-    """Retorna (dpid, puerto) del host con la MAC dada."""
-    url = f"{BASE_URL}/wm/device/"
-    resp = requests.get(url)
-    if resp.status_code == 200:
-        for dev in resp.json():
-            if mac.lower() in [m.lower() for m in dev.get("mac", [])]:
-                ap = dev.get("attachmentPoint", [{}])[0]
-                return ap.get("switchDPID"), ap.get("port")
-    return None, None
-
-# --- OBTENER RUTA ENTRE DOS PUNTOS ---
-def get_route(src_dpid, src_port, dst_dpid, dst_port):
-    """Retorna lista de hops: (switch, puerto)"""
-    url = f"{BASE_URL}/wm/topology/route/{src_dpid}/{src_port}/{dst_dpid}/{dst_port}/json"
-    resp = requests.get(url)
-    if resp.status_code == 200:
-        return [(hop["switch"], hop["port"]) for hop in resp.json()]
-    return []
+        else:
+            print(" Opción inválida.")
 
 def get_attachment_point_by_ip(ip):
     url = f"{BASE_URL}/wm/device/"
-    r = requests.get(url)
-    if r.status_code == 200:
-        for dev in r.json():
-            if ip in dev.get("ipv4", []):
-                ap = dev.get("attachmentPoint", [])
-                if ap:
-                    return ap[0].get("switchDPID"), ap[0].get("port")
+    try:
+        r = requests.get(url)
+        if r.status_code == 200:
+            for dev in r.json():
+                if ip in dev.get("ipv4", []):
+                    ap = dev.get("attachmentPoint", [])
+                    if ap:
+                        return ap[0].get("switchDPID"), ap[0].get("port")
+    except Exception as e:
+        print(f"Error al consultar Floodlight: {e}")
     return None, None
 
-def instalar_flows(ruta, mac_origen, ip_destino, servicio):
-    proto = servicio.protocolo.lower()
-    puerto = servicio.puerto
-    ip_proto = 6 if proto == "tcp" else 17
+# ===== insertar y eliminar flows =====
+def push_flow(flow):
+    url = f"{BASE_URL}/wm/staticflowpusher/json"
+    headers = {"Content-Type": "application/json"}
+    try:
+        response = requests.post(url, json=flow, headers=headers)
+        if response.status_code == 200:
+            print(" Flow instalado en Floodlight.")
+        else:
+            print(f" Error al instalar flow: {response.text}")
+    except Exception as e:
+        print(f" No se pudo conectar a Floodlight: {e}")
 
-    print("\nRuta calculada:")
-    for hop in ruta:
-        print(f"  - Switch: {hop[0]}, Puerto: {hop[1]}")
 
-    # Instalar flows en cada par de saltos
-    for i in range(len(ruta) - 1):
-        dpid = ruta[i][0]
-        in_port = ruta[i][1]
-        out_port = ruta[i + 1][1]
+def delete_flow(flow_name):
+    url = f"{BASE_URL}/wm/staticflowpusher/json"
+    data = {"name": flow_name}
+    headers = {"Content-Type": "application/json"}
+    try:
+        response = requests.delete(url, json=data, headers=headers)
+        if response.status_code == 200:
+            print(" Flow eliminado de Floodlight.")
+        else:
+            print(f" Error al eliminar flow: {response.text}")
+    except Exception as e:
+        print(f" No se pudo conectar a Floodlight: {e}")
 
-        # Tráfico de H1 a H3 (SSH)
-        flow_alumno_a_srv = {
-            "switch": dpid,
-            "name": f"fwd-{uuid.uuid4()}",
-            "priority": 40000,
-            "eth_type": "0x0800",
-            "eth_src": mac_origen,
-            "ipv4_dst": ip_destino,
-            "ip_proto": ip_proto,
-            f"{proto}_dst": puerto,
-            "active": "true",
-            "actions": f"output={out_port}"
-        }
-
-        # Tráfico de retorno (H3 a H1)
-        flow_srv_a_alumno = {
-            "switch": dpid,
-            "name": f"rev-{uuid.uuid4()}",
-            "priority": 40000,
-            "eth_type": "0x0800",
-            "ipv4_src": ip_destino,
-            "ip_proto": ip_proto,
-            f"{proto}_src": puerto,
-            "active": "true",
-            "actions": f"output={in_port}"
-        }
-
-        # ARP flow
-        flow_arp = {
-            "switch": dpid,
-            "name": f"arp-{uuid.uuid4()}",
-            "eth_type": "0x0806",
-            "priority": 30000,
-            "active": "true",
-            "actions": f"output={out_port}"
-        }
-
-        for flow in [flow_alumno_a_srv, flow_srv_a_alumno, flow_arp]:
-            resp = requests.post(f"{BASE_URL}/wm/staticflowpusher/json",
-                                 headers=HEADERS, data=json.dumps(flow))
-            print("Instalando flow:", json.dumps(flow, indent=2))
-            print(f"Respuesta: {resp.status_code} {resp.text}")
-            if resp.status_code != 200:
-                print(f"Error instalando flow en {dpid}: {resp.text}")
-
-    # Último salto hacia H3 (flow directo al host destino)
-    last_dpid, last_port = ruta[-1]
-    flow_final = {
-        "switch": last_dpid,
-        "name": f"final-{uuid.uuid4()}",
-        "priority": 40000,
-        "eth_type": "0x0800",
-        "ipv4_dst": ip_destino,
-        "ip_proto": ip_proto,
-        f"{proto}_dst": puerto,
-        "active": "true",
-        "actions": f"output={last_port}"
-    }
-
-    resp = requests.post(f"{BASE_URL}/wm/staticflowpusher/json",
-                         headers=HEADERS, data=json.dumps(flow_final))
-    print("Instalando último flow (servidor):", json.dumps(flow_final, indent=2))
-    print(f"Respuesta: {resp.status_code} {resp.text}")
-
-    # ARP en el último switch
-    flow_arp_final = {
-        "switch": last_dpid,
-        "name": f"arp-final-{uuid.uuid4()}",
-        "eth_type": "0x0806",
-        "priority": 30000,
-        "active": "true",
-        "actions": f"output={last_port}"
-    }
-
-    resp_arp = requests.post(f"{BASE_URL}/wm/staticflowpusher/json",
-                             headers=HEADERS, data=json.dumps(flow_arp_final))
-    print("Instalando ARP final:", json.dumps(flow_arp_final, indent=2))
-    print(f"Respuesta: {resp_arp.status_code} {resp_arp.text}")
 
 
 
